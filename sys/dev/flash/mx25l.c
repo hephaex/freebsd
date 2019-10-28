@@ -150,6 +150,7 @@ static struct mx25l_flash_ident flash_devices[] = {
 
 	/* GigaDevice */
 	{ "gd25q64",	0xc8, 0x4017, 64 * 1024, 128, FL_ERASE_4K },
+	{ "gd25q128",	0xc8, 0x4018, 64 * 1024, 256, FL_ERASE_4K },
 };
 
 static int
@@ -510,7 +511,7 @@ mx25l_attach(device_t dev)
 	sc->sc_disk->d_strategy = mx25l_strategy;
 	sc->sc_disk->d_getattr = mx25l_getattr;
 	sc->sc_disk->d_ioctl = mx25l_ioctl;
-	sc->sc_disk->d_name = "flash/mx25l";
+	sc->sc_disk->d_name = "flash/spi";
 	sc->sc_disk->d_drv1 = sc;
 	sc->sc_disk->d_maxsize = DFLTPHYS;
 	sc->sc_disk->d_sectorsize = MX25L_SECTORSIZE;
@@ -522,7 +523,6 @@ mx25l_attach(device_t dev)
 	    sizeof(sc->sc_disk->d_descr));
 
 	disk_create(sc->sc_disk, DISK_VERSION);
-	disk_add_alias(sc->sc_disk, "flash/spi");
 	bioq_init(&sc->sc_bio_queue);
 
 	kproc_create(&mx25l_task, sc, &sc->sc_p, 0, 0, "task: mx25l flash");
@@ -687,5 +687,5 @@ DRIVER_MODULE(mx25l, spibus, mx25l_driver, mx25l_devclass, 0, 0);
 MODULE_DEPEND(mx25l, spibus, 1, 1, 1);
 #ifdef	FDT
 MODULE_DEPEND(mx25l, fdt_slicer, 1, 1, 1);
-SPIBUS_PNP_INFO(compat_data);
+SPIBUS_FDT_PNP_INFO(compat_data);
 #endif

@@ -230,6 +230,15 @@ static void cxgbe_init(void *);
 static int cxgbe_ioctl(struct ifnet *, unsigned long, caddr_t);
 static int cxgbe_transmit(struct ifnet *, struct mbuf *);
 static void cxgbe_qflush(struct ifnet *);
+#ifdef RATELIMIT
+static int cxgbe_snd_tag_alloc(struct ifnet *, union if_snd_tag_alloc_params *,
+    struct m_snd_tag **);
+static int cxgbe_snd_tag_modify(struct m_snd_tag *,
+    union if_snd_tag_modify_params *);
+static int cxgbe_snd_tag_query(struct m_snd_tag *,
+    union if_snd_tag_query_params *);
+static void cxgbe_snd_tag_free(struct m_snd_tag *);
+#endif
 
 MALLOC_DEFINE(M_CXGBE, "cxgbe", "Chelsio T4/T5 Ethernet driver and services");
 
@@ -626,6 +635,8 @@ static void quiesce_fl(struct adapter *, struct sge_fl *);
 static int t4_alloc_irq(struct adapter *, struct irq *, int rid,
     driver_intr_t *, void *, char *);
 static int t4_free_irq(struct adapter *, struct irq *);
+static void t4_init_atid_table(struct adapter *);
+static void t4_free_atid_table(struct adapter *);
 static void get_regs(struct adapter *, struct t4_regdump *, uint8_t *);
 static void vi_refresh_stats(struct adapter *, struct vi_info *);
 static void cxgbe_refresh_stats(struct adapter *, struct port_info *);
@@ -694,6 +705,7 @@ static void free_offload_policy(struct t4_offload_policy *);
 static int set_offload_policy(struct adapter *, struct t4_offload_policy *);
 static int read_card_mem(struct adapter *, int, struct t4_mem_range *);
 static int read_i2c(struct adapter *, struct t4_i2c_data *);
+static int clear_stats(struct adapter *, u_int);
 #ifdef TCP_OFFLOAD
 static int toe_capability(struct vi_info *, int);
 #endif
@@ -1235,6 +1247,7 @@ t4_attach(device_t dev)
 	t4_init_l2t(sc, M_WAITOK);
 	t4_init_smt(sc, M_WAITOK);
 	t4_init_tx_sched(sc);
+	t4_init_atid_table(sc);
 #ifdef RATELIMIT
 	t4_init_etid_table(sc);
 #endif
@@ -1474,6 +1487,10 @@ t4_detach_common(device_t dev)
 		sc->cdev = NULL;
 	}
 
+	sx_xlock(&t4_list_lock);
+	SLIST_REMOVE(&t4_list, sc, adapter, link);
+	sx_xunlock(&t4_list_lock);
+
 	sc->flags &= ~CHK_MBOX_ACCESS;
 	if (sc->flags & FULL_INIT_DONE) {
 		if (!(sc->flags & IS_VF))
@@ -1535,6 +1552,7 @@ t4_detach_common(device_t dev)
 		t4_free_l2t(sc->l2t);
 	if (sc->smt)
 		t4_free_smt(sc->smt);
+	t4_free_atid_table(sc);
 #ifdef RATELIMIT
 	t4_free_etid_table(sc);
 #endif
@@ -1563,16 +1581,9 @@ t4_detach_common(device_t dev)
 	free(sc->tids.ftid_tab, M_CXGBE);
 	free(sc->tids.hpftid_tab, M_CXGBE);
 	free_hftid_hash(&sc->tids);
-	free(sc->tids.atid_tab, M_CXGBE);
 	free(sc->tids.tid_tab, M_CXGBE);
 	free(sc->tt.tls_rx_ports, M_CXGBE);
 	t4_destroy_dma_tag(sc);
-	if (mtx_initialized(&sc->sc_lock)) {
-		sx_xlock(&t4_list_lock);
-		SLIST_REMOVE(&t4_list, sc, adapter, link);
-		sx_xunlock(&t4_list_lock);
-		mtx_destroy(&sc->sc_lock);
-	}
 
 	callout_drain(&sc->sfl_callout);
 	if (mtx_initialized(&sc->tids.ftid_lock)) {
@@ -1581,12 +1592,8 @@ t4_detach_common(device_t dev)
 	}
 	if (mtx_initialized(&sc->tids.atid_lock))
 		mtx_destroy(&sc->tids.atid_lock);
-	if (mtx_initialized(&sc->sfl_lock))
-		mtx_destroy(&sc->sfl_lock);
 	if (mtx_initialized(&sc->ifp_lock))
 		mtx_destroy(&sc->ifp_lock);
-	if (mtx_initialized(&sc->reg_lock))
-		mtx_destroy(&sc->reg_lock);
 
 	if (rw_initialized(&sc->policy_lock)) {
 		rw_destroy(&sc->policy_lock);
@@ -1602,6 +1609,10 @@ t4_detach_common(device_t dev)
 		if (rw_initialized(&mw->mw_lock))
 			rw_destroy(&mw->mw_lock);
 	}
+
+	mtx_destroy(&sc->sfl_lock);
+	mtx_destroy(&sc->reg_lock);
+	mtx_destroy(&sc->sc_lock);
 
 	bzero(sc, sizeof(*sc));
 
@@ -1623,7 +1634,7 @@ cxgbe_probe(device_t dev)
 #define T4_CAP (IFCAP_VLAN_HWTAGGING | IFCAP_VLAN_MTU | IFCAP_HWCSUM | \
     IFCAP_VLAN_HWCSUM | IFCAP_TSO | IFCAP_JUMBO_MTU | IFCAP_LRO | \
     IFCAP_VLAN_HWTSO | IFCAP_LINKSTATE | IFCAP_HWCSUM_IPV6 | IFCAP_HWSTATS | \
-    IFCAP_HWRXTSTMP)
+    IFCAP_HWRXTSTMP | IFCAP_NOMAP)
 #define T4_CAP_ENABLE (T4_CAP)
 
 static int
@@ -1636,7 +1647,7 @@ cxgbe_vi_attach(device_t dev, struct vi_info *vi)
 	callout_init(&vi->tick, 1);
 
 	/* Allocate an ifnet and set it up */
-	ifp = if_alloc(IFT_ETHER);
+	ifp = if_alloc_dev(IFT_ETHER, dev);
 	if (ifp == NULL) {
 		device_printf(dev, "Cannot allocate ifnet\n");
 		return (ENOMEM);
@@ -1657,6 +1668,7 @@ cxgbe_vi_attach(device_t dev, struct vi_info *vi)
 	ifp->if_snd_tag_modify = cxgbe_snd_tag_modify;
 	ifp->if_snd_tag_query = cxgbe_snd_tag_query;
 	ifp->if_snd_tag_free = cxgbe_snd_tag_free;
+	ifp->if_ratelimit_query = cxgbe_ratelimit_query;
 #endif
 
 	ifp->if_capabilities = T4_CAP;
@@ -1986,6 +1998,8 @@ cxgbe_ioctl(struct ifnet *ifp, unsigned long cmd, caddr_t data)
 					rxq->iq.flags &= ~IQ_RX_TIMESTAMP;
 			}
 		}
+		if (mask & IFCAP_NOMAP)
+			ifp->if_capenable ^= IFCAP_NOMAP;
 
 #ifdef VLAN_CAPABILITIES
 		VLAN_CAPABILITIES(ifp);
@@ -2039,11 +2053,18 @@ cxgbe_transmit(struct ifnet *ifp, struct mbuf *m)
 	struct port_info *pi = vi->pi;
 	struct adapter *sc = pi->adapter;
 	struct sge_txq *txq;
+#ifdef RATELIMIT
+	struct cxgbe_snd_tag *cst;
+#endif
 	void *items[1];
 	int rc;
 
 	M_ASSERTPKTHDR(m);
 	MPASS(m->m_nextpkt == NULL);	/* not quite ready for this yet */
+#ifdef RATELIMIT
+	if (m->m_pkthdr.csum_flags & CSUM_SND_TAG)
+		MPASS(m->m_pkthdr.snd_tag->ifp == ifp);
+#endif
 
 	if (__predict_false(pi->link_cfg.link_ok == false)) {
 		m_freem(m);
@@ -2057,14 +2078,10 @@ cxgbe_transmit(struct ifnet *ifp, struct mbuf *m)
 		return (rc);
 	}
 #ifdef RATELIMIT
-	if (m->m_pkthdr.snd_tag != NULL) {
-		/* EAGAIN tells the stack we are not the correct interface. */
-		if (__predict_false(ifp != m->m_pkthdr.snd_tag->ifp)) {
-			m_freem(m);
-			return (EAGAIN);
-		}
-
-		return (ethofld_transmit(ifp, m));
+	if (m->m_pkthdr.csum_flags & CSUM_SND_TAG) {
+		cst = mst_to_cst(m->m_pkthdr.snd_tag);
+		if (cst->type == IF_SND_TAG_TYPE_RATE_LIMIT)
+			return (ethofld_transmit(ifp, m));
 	}
 #endif
 
@@ -2221,6 +2238,87 @@ cxgbe_get_counter(struct ifnet *ifp, ift_counter c)
 		return (if_get_counter_default(ifp, c));
 	}
 }
+
+#ifdef RATELIMIT
+void
+cxgbe_snd_tag_init(struct cxgbe_snd_tag *cst, struct ifnet *ifp, int type)
+{
+
+	m_snd_tag_init(&cst->com, ifp);
+	cst->type = type;
+}
+
+static int
+cxgbe_snd_tag_alloc(struct ifnet *ifp, union if_snd_tag_alloc_params *params,
+    struct m_snd_tag **pt)
+{
+	int error;
+
+	switch (params->hdr.type) {
+#ifdef RATELIMIT
+	case IF_SND_TAG_TYPE_RATE_LIMIT:
+		error = cxgbe_rate_tag_alloc(ifp, params, pt);
+		break;
+#endif
+	default:
+		error = EOPNOTSUPP;
+	}
+	if (error == 0)
+		MPASS(mst_to_cst(*pt)->type == params->hdr.type);
+	return (error);
+}
+
+static int
+cxgbe_snd_tag_modify(struct m_snd_tag *mst,
+    union if_snd_tag_modify_params *params)
+{
+	struct cxgbe_snd_tag *cst;
+
+	cst = mst_to_cst(mst);
+	switch (cst->type) {
+#ifdef RATELIMIT
+	case IF_SND_TAG_TYPE_RATE_LIMIT:
+		return (cxgbe_rate_tag_modify(mst, params));
+#endif
+	default:
+		return (EOPNOTSUPP);
+	}
+}
+
+static int
+cxgbe_snd_tag_query(struct m_snd_tag *mst,
+    union if_snd_tag_query_params *params)
+{
+	struct cxgbe_snd_tag *cst;
+
+	cst = mst_to_cst(mst);
+	switch (cst->type) {
+#ifdef RATELIMIT
+	case IF_SND_TAG_TYPE_RATE_LIMIT:
+		return (cxgbe_rate_tag_query(mst, params));
+#endif
+	default:
+		return (EOPNOTSUPP);
+	}
+}
+
+static void
+cxgbe_snd_tag_free(struct m_snd_tag *mst)
+{
+	struct cxgbe_snd_tag *cst;
+
+	cst = mst_to_cst(mst);
+	switch (cst->type) {
+#ifdef RATELIMIT
+	case IF_SND_TAG_TYPE_RATE_LIMIT:
+		cxgbe_rate_tag_free(mst);
+		return;
+#endif
+	default:
+		panic("shouldn't get here");
+	}
+}
+#endif
 
 /*
  * The kernel picks a media from the list we had provided but we still validate
@@ -2486,17 +2584,13 @@ alloc_extra_vi(struct adapter *sc, struct port_info *pi, struct vi_info *vi)
 	    device_get_nameunit(vi->dev)));
 	func = vi_mac_funcs[index];
 	rc = t4_alloc_vi_func(sc, sc->mbox, pi->tx_chan, sc->pf, 0, 1,
-	    vi->hw_addr, &vi->rss_size, func, 0);
+	    vi->hw_addr, &vi->rss_size, &vi->vfvld, &vi->vin, func, 0);
 	if (rc < 0) {
 		device_printf(vi->dev, "failed to allocate virtual interface %d"
 		    "for port %d: %d\n", index, pi->port_id, -rc);
 		return (-rc);
 	}
 	vi->viid = rc;
-	if (chip_id(sc) <= CHELSIO_T5)
-		vi->smt_idx = (rc & 0x7f) << 1;
-	else
-		vi->smt_idx = (rc & 0x7f);
 
 	if (vi->rss_size == 1) {
 		/*
@@ -2836,31 +2930,34 @@ rw_via_memwin(struct adapter *sc, int idx, uint32_t addr, uint32_t *val,
 	return (0);
 }
 
-int
-alloc_atid_tab(struct tid_info *t, int flags)
+static void
+t4_init_atid_table(struct adapter *sc)
 {
+	struct tid_info *t;
 	int i;
 
-	MPASS(t->natids > 0);
+	t = &sc->tids;
+	if (t->natids == 0)
+		return;
+
 	MPASS(t->atid_tab == NULL);
 
 	t->atid_tab = malloc(t->natids * sizeof(*t->atid_tab), M_CXGBE,
-	    M_ZERO | flags);
-	if (t->atid_tab == NULL)
-		return (ENOMEM);
+	    M_ZERO | M_WAITOK);
 	mtx_init(&t->atid_lock, "atid lock", NULL, MTX_DEF);
 	t->afree = t->atid_tab;
 	t->atids_in_use = 0;
 	for (i = 1; i < t->natids; i++)
 		t->atid_tab[i - 1].next = &t->atid_tab[i];
 	t->atid_tab[t->natids - 1].next = NULL;
-
-	return (0);
 }
 
-void
-free_atid_tab(struct tid_info *t)
+static void
+t4_free_atid_table(struct adapter *sc)
 {
+	struct tid_info *t;
+
+	t = &sc->tids;
 
 	KASSERT(t->atids_in_use == 0,
 	    ("%s: %d atids still in use.", __func__, t->atids_in_use));
@@ -3533,19 +3630,6 @@ install_kld_firmware(struct adapter *sc, struct fw_h *card_fw,
 	load_attempted = false;
 	fw_install = t4_fw_install < 0 ? -t4_fw_install : t4_fw_install;
 
-	if (reason != NULL)
-		goto install;
-
-	if ((sc->flags & FW_OK) == 0) {
-
-		if (c == 0xffffffff) {
-			reason = "missing";
-			goto install;
-		}
-
-		return (0);
-	}
-
 	memcpy(&bundled_fw, drv_fw, sizeof(bundled_fw));
 	if (t4_fw_install < 0) {
 		rc = load_fw_module(sc, &cfg, &fw);
@@ -3561,6 +3645,20 @@ install_kld_firmware(struct adapter *sc, struct fw_h *card_fw,
 		load_attempted = true;
 	}
 	d = be32toh(bundled_fw.fw_ver);
+
+	if (reason != NULL)
+		goto install;
+
+	if ((sc->flags & FW_OK) == 0) {
+
+		if (c == 0xffffffff) {
+			reason = "missing";
+			goto install;
+		}
+
+		rc = 0;
+		goto done;
+	}
 
 	if (!fw_compatible(card_fw, &bundled_fw)) {
 		reason = "incompatible or unusable";
@@ -4015,10 +4113,8 @@ retry:
 		    rc, cfg_file);
 		snprintf(cfg_file, sizeof(cfg_file), "%s", BUILTIN_CF);
 		bzero(&caps_allowed, sizeof(caps_allowed));
-		COPY_CAPS(nbm);
-		COPY_CAPS(link);
 		COPY_CAPS(switch);
-		COPY_CAPS(nic);
+		caps_allowed.niccaps = FW_CAPS_CONFIG_NIC;
 		fallback = false;
 		goto retry;
 	}
@@ -4112,6 +4208,15 @@ set_params__pre_init(struct adapter *sc)
 			    rc);
 		}
 	}
+
+	/* Enable opaque VIIDs with firmwares that support it. */
+	param = FW_PARAM_DEV(OPAQUE_VIID_SMT_EXTN);
+	val = 1;
+	rc = -t4_set_params(sc, sc->mbox, sc->pf, 0, 1, &param, &val);
+	if (rc == 0 && val == 1)
+		sc->params.viid_smt_extn_support = true;
+	else
+		sc->params.viid_smt_extn_support = false;
 
 	return (rc);
 }
@@ -4781,6 +4886,54 @@ apply_link_config(struct port_info *pi)
 }
 
 #define FW_MAC_EXACT_CHUNK	7
+struct mcaddr_ctx {
+	struct ifnet *ifp;
+	const uint8_t *mcaddr[FW_MAC_EXACT_CHUNK];
+	uint64_t hash;
+	int i;
+	int del;
+	int rc;
+};
+
+static u_int
+add_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	struct mcaddr_ctx *ctx = arg;
+	struct vi_info *vi = ctx->ifp->if_softc;
+	struct port_info *pi = vi->pi;
+	struct adapter *sc = pi->adapter;
+
+	if (ctx->rc < 0)
+		return (0);
+
+	ctx->mcaddr[ctx->i] = LLADDR(sdl);
+	MPASS(ETHER_IS_MULTICAST(ctx->mcaddr[ctx->i]));
+	ctx->i++;
+
+	if (ctx->i == FW_MAC_EXACT_CHUNK) {
+		ctx->rc = t4_alloc_mac_filt(sc, sc->mbox, vi->viid, ctx->del,
+		    ctx->i, ctx->mcaddr, NULL, &ctx->hash, 0);
+		if (ctx->rc < 0) {
+			int j;
+
+			for (j = 0; j < ctx->i; j++) {
+				if_printf(ctx->ifp,
+				    "failed to add mc address"
+				    " %02x:%02x:%02x:"
+				    "%02x:%02x:%02x rc=%d\n",
+				    ctx->mcaddr[j][0], ctx->mcaddr[j][1],
+				    ctx->mcaddr[j][2], ctx->mcaddr[j][3],
+				    ctx->mcaddr[j][4], ctx->mcaddr[j][5],
+				    -ctx->rc);
+			}
+			return (0);
+		}
+		ctx->del = 0;
+		ctx->i = 0;
+	}
+
+	return (1);
+}
 
 /*
  * Program the port's XGMAC based on parameters in ifnet.  The caller also
@@ -4825,7 +4978,7 @@ update_mac_settings(struct ifnet *ifp, int flags)
 
 		bcopy(IF_LLADDR(ifp), ucaddr, sizeof(ucaddr));
 		rc = t4_change_mac(sc, sc->mbox, vi->viid, vi->xact_addr_filt,
-		    ucaddr, true, true);
+		    ucaddr, true, &vi->smt_idx);
 		if (rc < 0) {
 			rc = -rc;
 			if_printf(ifp, "change_mac failed: %d\n", rc);
@@ -4837,66 +4990,51 @@ update_mac_settings(struct ifnet *ifp, int flags)
 	}
 
 	if (flags & XGMAC_MCADDRS) {
-		const uint8_t *mcaddr[FW_MAC_EXACT_CHUNK];
-		int del = 1;
-		uint64_t hash = 0;
-		struct ifmultiaddr *ifma;
-		int i = 0, j;
+		struct epoch_tracker et;
+		struct mcaddr_ctx ctx;
+		int j;
 
-		if_maddr_rlock(ifp);
-		CK_STAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
-			if (ifma->ifma_addr->sa_family != AF_LINK)
-				continue;
-			mcaddr[i] =
-			    LLADDR((struct sockaddr_dl *)ifma->ifma_addr);
-			MPASS(ETHER_IS_MULTICAST(mcaddr[i]));
-			i++;
-
-			if (i == FW_MAC_EXACT_CHUNK) {
-				rc = t4_alloc_mac_filt(sc, sc->mbox, vi->viid,
-				    del, i, mcaddr, NULL, &hash, 0);
-				if (rc < 0) {
-					rc = -rc;
-					for (j = 0; j < i; j++) {
-						if_printf(ifp,
-						    "failed to add mc address"
-						    " %02x:%02x:%02x:"
-						    "%02x:%02x:%02x rc=%d\n",
-						    mcaddr[j][0], mcaddr[j][1],
-						    mcaddr[j][2], mcaddr[j][3],
-						    mcaddr[j][4], mcaddr[j][5],
-						    rc);
-					}
-					goto mcfail;
-				}
-				del = 0;
-				i = 0;
-			}
+		ctx.ifp = ifp;
+		ctx.hash = 0;
+		ctx.i = 0;
+		ctx.del = 1;
+		/*
+		 * Unlike other drivers, we accumulate list of pointers into
+		 * interface address lists and we need to keep it safe even
+		 * after if_foreach_llmaddr() returns, thus we must enter the
+		 * network epoch.
+		 */
+		NET_EPOCH_ENTER(et);
+		if_foreach_llmaddr(ifp, add_maddr, &ctx);
+		if (ctx.rc < 0) {
+			NET_EPOCH_EXIT(et);
+			rc = -ctx.rc;
+			return (rc);
 		}
-		if (i > 0) {
-			rc = t4_alloc_mac_filt(sc, sc->mbox, vi->viid, del, i,
-			    mcaddr, NULL, &hash, 0);
+		if (ctx.i > 0) {
+			rc = t4_alloc_mac_filt(sc, sc->mbox, vi->viid,
+			    ctx.del, ctx.i, ctx.mcaddr, NULL, &ctx.hash, 0);
+			NET_EPOCH_EXIT(et);
 			if (rc < 0) {
 				rc = -rc;
-				for (j = 0; j < i; j++) {
+				for (j = 0; j < ctx.i; j++) {
 					if_printf(ifp,
 					    "failed to add mc address"
 					    " %02x:%02x:%02x:"
 					    "%02x:%02x:%02x rc=%d\n",
-					    mcaddr[j][0], mcaddr[j][1],
-					    mcaddr[j][2], mcaddr[j][3],
-					    mcaddr[j][4], mcaddr[j][5],
+					    ctx.mcaddr[j][0], ctx.mcaddr[j][1],
+					    ctx.mcaddr[j][2], ctx.mcaddr[j][3],
+					    ctx.mcaddr[j][4], ctx.mcaddr[j][5],
 					    rc);
 				}
-				goto mcfail;
+				return (rc);
 			}
-		}
+		} else
+			NET_EPOCH_EXIT(et);
 
-		rc = -t4_set_addr_hash(sc, sc->mbox, vi->viid, 0, hash, 0);
+		rc = -t4_set_addr_hash(sc, sc->mbox, vi->viid, 0, ctx.hash, 0);
 		if (rc != 0)
 			if_printf(ifp, "failed to set mc address hash: %d", rc);
-mcfail:
-		if_maddr_runlock(ifp);
 	}
 
 	return (rc);
@@ -5746,7 +5884,7 @@ get_regs(struct adapter *sc, struct t4_regdump *regs, uint8_t *buf)
 #define	A_PL_INDIR_DATA	0x1fc
 
 static uint64_t
-read_vf_stat(struct adapter *sc, unsigned int viid, int reg)
+read_vf_stat(struct adapter *sc, u_int vin, int reg)
 {
 	u32 stats[2];
 
@@ -5756,8 +5894,7 @@ read_vf_stat(struct adapter *sc, unsigned int viid, int reg)
 		stats[1] = t4_read_reg(sc, VF_MPS_REG(reg + 4));
 	} else {
 		t4_write_reg(sc, A_PL_INDIR_CMD, V_PL_AUTOINC(1) |
-		    V_PL_VFID(G_FW_VIID_VIN(viid)) |
-		    V_PL_ADDR(VF_MPS_REG(reg)));
+		    V_PL_VFID(vin) | V_PL_ADDR(VF_MPS_REG(reg)));
 		stats[0] = t4_read_reg(sc, A_PL_INDIR_DATA);
 		stats[1] = t4_read_reg(sc, A_PL_INDIR_DATA);
 	}
@@ -5765,12 +5902,11 @@ read_vf_stat(struct adapter *sc, unsigned int viid, int reg)
 }
 
 static void
-t4_get_vi_stats(struct adapter *sc, unsigned int viid,
-    struct fw_vi_stats_vf *stats)
+t4_get_vi_stats(struct adapter *sc, u_int vin, struct fw_vi_stats_vf *stats)
 {
 
 #define GET_STAT(name) \
-	read_vf_stat(sc, viid, A_MPS_VF_STAT_##name##_L)
+	read_vf_stat(sc, vin, A_MPS_VF_STAT_##name##_L)
 
 	stats->tx_bcast_bytes    = GET_STAT(TX_VF_BCAST_BYTES);
 	stats->tx_bcast_frames   = GET_STAT(TX_VF_BCAST_FRAMES);
@@ -5793,12 +5929,11 @@ t4_get_vi_stats(struct adapter *sc, unsigned int viid,
 }
 
 static void
-t4_clr_vi_stats(struct adapter *sc, unsigned int viid)
+t4_clr_vi_stats(struct adapter *sc, u_int vin)
 {
 	int reg;
 
-	t4_write_reg(sc, A_PL_INDIR_CMD, V_PL_AUTOINC(1) |
-	    V_PL_VFID(G_FW_VIID_VIN(viid)) |
+	t4_write_reg(sc, A_PL_INDIR_CMD, V_PL_AUTOINC(1) | V_PL_VFID(vin) |
 	    V_PL_ADDR(VF_MPS_REG(A_MPS_VF_STAT_TX_VF_BCAST_BYTES_L)));
 	for (reg = A_MPS_VF_STAT_TX_VF_BCAST_BYTES_L;
 	     reg <= A_MPS_VF_STAT_RX_VF_ERR_FRAMES_H; reg += 4)
@@ -5820,7 +5955,7 @@ vi_refresh_stats(struct adapter *sc, struct vi_info *vi)
 		return;
 
 	mtx_lock(&sc->reg_lock);
-	t4_get_vi_stats(sc, vi->viid, &vi->stats);
+	t4_get_vi_stats(sc, vi->vin, &vi->stats);
 	getmicrotime(&vi->last_refreshed);
 	mtx_unlock(&sc->reg_lock);
 }
@@ -6029,6 +6164,9 @@ t4_sysctls(struct adapter *sc)
 	    CTLTYPE_STRING | CTLFLAG_RD, sc, INTR_CPUS,
 	    sysctl_cpus, "A", "preferred CPUs for interrupts");
 
+	SYSCTL_ADD_INT(ctx, children, OID_AUTO, "swintr", CTLFLAG_RW,
+	    &sc->swintr, 0, "software triggered interrupts");
+
 	/*
 	 * dev.t4nex.X.misc.  Marked CTLFLAG_SKIP to avoid information overload.
 	 */
@@ -6226,15 +6364,17 @@ t4_sysctls(struct adapter *sc)
 		    "(-1 = default, 0 = reno, 1 = tahoe, 2 = newreno, "
 		    "3 = highspeed)");
 
-		sc->tt.sndbuf = 256 * 1024;
+		sc->tt.sndbuf = -1;
 		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "sndbuf", CTLFLAG_RW,
-		    &sc->tt.sndbuf, 0, "max hardware send buffer size");
+		    &sc->tt.sndbuf, 0, "hardware send buffer");
 
 		sc->tt.ddp = 0;
-		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "ddp", CTLFLAG_RW,
-		    &sc->tt.ddp, 0, "DDP allowed");
+		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "ddp",
+		    CTLFLAG_RW | CTLFLAG_SKIP, &sc->tt.ddp, 0, "");
+		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "rx_zcopy", CTLFLAG_RW,
+		    &sc->tt.ddp, 0, "Enable zero-copy aio_read(2)");
 
-		sc->tt.rx_coalesce = 1;
+		sc->tt.rx_coalesce = -1;
 		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "rx_coalesce",
 		    CTLFLAG_RW, &sc->tt.rx_coalesce, 0, "receive coalescing");
 
@@ -6246,7 +6386,7 @@ t4_sysctls(struct adapter *sc)
 		    CTLTYPE_INT | CTLFLAG_RW, sc, 0, sysctl_tls_rx_ports,
 		    "I", "TCP ports that use inline TLS+TOE RX");
 
-		sc->tt.tx_align = 1;
+		sc->tt.tx_align = -1;
 		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "tx_align",
 		    CTLFLAG_RW, &sc->tt.tx_align, 0, "chop and align payload");
 
@@ -6260,6 +6400,11 @@ t4_sysctls(struct adapter *sc)
 		    "cop_managed_offloading", CTLFLAG_RW,
 		    &sc->tt.cop_managed_offloading, 0,
 		    "COP (Connection Offload Policy) controls all TOE offload");
+
+		sc->tt.autorcvbuf_inc = 16 * 1024;
+		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "autorcvbuf_inc",
+		    CTLFLAG_RW, &sc->tt.autorcvbuf_inc, 0,
+		    "autorcvbuf increment");
 
 		SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "timer_tick",
 		    CTLTYPE_STRING | CTLFLAG_RD, sc, 0, sysctl_tp_tick, "A",
@@ -9703,7 +9848,7 @@ set_offload_policy(struct adapter *sc, struct t4_offload_policy *uop)
 		/* Delete installed policies. */
 		op = NULL;
 		goto set_policy;
-	} if (uop->nrules > 256) { /* arbitrary */
+	} else if (uop->nrules > 256) { /* arbitrary */
 		return (E2BIG);
 	}
 
@@ -9831,6 +9976,108 @@ read_i2c(struct adapter *sc, struct t4_i2c_data *i2cd)
 	end_synchronized_op(sc, 0);
 
 	return (rc);
+}
+
+static int
+clear_stats(struct adapter *sc, u_int port_id)
+{
+	int i, v, bg_map;
+	struct port_info *pi;
+	struct vi_info *vi;
+	struct sge_rxq *rxq;
+	struct sge_txq *txq;
+	struct sge_wrq *wrq;
+#ifdef TCP_OFFLOAD
+	struct sge_ofld_rxq *ofld_rxq;
+#endif
+
+	if (port_id >= sc->params.nports)
+		return (EINVAL);
+	pi = sc->port[port_id];
+	if (pi == NULL)
+		return (EIO);
+
+	/* MAC stats */
+	t4_clr_port_stats(sc, pi->tx_chan);
+	pi->tx_parse_error = 0;
+	pi->tnl_cong_drops = 0;
+	mtx_lock(&sc->reg_lock);
+	for_each_vi(pi, v, vi) {
+		if (vi->flags & VI_INIT_DONE)
+			t4_clr_vi_stats(sc, vi->vin);
+	}
+	bg_map = pi->mps_bg_map;
+	v = 0;	/* reuse */
+	while (bg_map) {
+		i = ffs(bg_map) - 1;
+		t4_write_indirect(sc, A_TP_MIB_INDEX, A_TP_MIB_DATA, &v,
+		    1, A_TP_MIB_TNL_CNG_DROP_0 + i);
+		bg_map &= ~(1 << i);
+	}
+	mtx_unlock(&sc->reg_lock);
+
+	/*
+	 * Since this command accepts a port, clear stats for
+	 * all VIs on this port.
+	 */
+	for_each_vi(pi, v, vi) {
+		if (vi->flags & VI_INIT_DONE) {
+
+			for_each_rxq(vi, i, rxq) {
+#if defined(INET) || defined(INET6)
+				rxq->lro.lro_queued = 0;
+				rxq->lro.lro_flushed = 0;
+#endif
+				rxq->rxcsum = 0;
+				rxq->vlan_extraction = 0;
+
+				rxq->fl.mbuf_allocated = 0;
+				rxq->fl.mbuf_inlined = 0;
+				rxq->fl.cl_allocated = 0;
+				rxq->fl.cl_recycled = 0;
+				rxq->fl.cl_fast_recycled = 0;
+			}
+
+			for_each_txq(vi, i, txq) {
+				txq->txcsum = 0;
+				txq->tso_wrs = 0;
+				txq->vlan_insertion = 0;
+				txq->imm_wrs = 0;
+				txq->sgl_wrs = 0;
+				txq->txpkt_wrs = 0;
+				txq->txpkts0_wrs = 0;
+				txq->txpkts1_wrs = 0;
+				txq->txpkts0_pkts = 0;
+				txq->txpkts1_pkts = 0;
+				txq->raw_wrs = 0;
+				mp_ring_reset_stats(txq->r);
+			}
+
+#if defined(TCP_OFFLOAD) || defined(RATELIMIT)
+			for_each_ofld_txq(vi, i, wrq) {
+				wrq->tx_wrs_direct = 0;
+				wrq->tx_wrs_copied = 0;
+			}
+#endif
+#ifdef TCP_OFFLOAD
+			for_each_ofld_rxq(vi, i, ofld_rxq) {
+				ofld_rxq->fl.mbuf_allocated = 0;
+				ofld_rxq->fl.mbuf_inlined = 0;
+				ofld_rxq->fl.cl_allocated = 0;
+				ofld_rxq->fl.cl_recycled = 0;
+				ofld_rxq->fl.cl_fast_recycled = 0;
+			}
+#endif
+
+			if (IS_MAIN_VI(vi)) {
+				wrq = &sc->sge.ctrlq[pi->port_id];
+				wrq->tx_wrs_direct = 0;
+				wrq->tx_wrs_copied = 0;
+			}
+		}
+	}
+
+	return (0);
 }
 
 int
@@ -10036,89 +10283,9 @@ t4_ioctl(struct cdev *dev, unsigned long cmd, caddr_t data, int fflag,
 	case CHELSIO_T4_GET_I2C:
 		rc = read_i2c(sc, (struct t4_i2c_data *)data);
 		break;
-	case CHELSIO_T4_CLEAR_STATS: {
-		int i, v, bg_map;
-		u_int port_id = *(uint32_t *)data;
-		struct port_info *pi;
-		struct vi_info *vi;
-
-		if (port_id >= sc->params.nports)
-			return (EINVAL);
-		pi = sc->port[port_id];
-		if (pi == NULL)
-			return (EIO);
-
-		/* MAC stats */
-		t4_clr_port_stats(sc, pi->tx_chan);
-		pi->tx_parse_error = 0;
-		pi->tnl_cong_drops = 0;
-		mtx_lock(&sc->reg_lock);
-		for_each_vi(pi, v, vi) {
-			if (vi->flags & VI_INIT_DONE)
-				t4_clr_vi_stats(sc, vi->viid);
-		}
-		bg_map = pi->mps_bg_map;
-		v = 0;	/* reuse */
-		while (bg_map) {
-			i = ffs(bg_map) - 1;
-			t4_write_indirect(sc, A_TP_MIB_INDEX, A_TP_MIB_DATA, &v,
-			    1, A_TP_MIB_TNL_CNG_DROP_0 + i);
-			bg_map &= ~(1 << i);
-		}
-		mtx_unlock(&sc->reg_lock);
-
-		/*
-		 * Since this command accepts a port, clear stats for
-		 * all VIs on this port.
-		 */
-		for_each_vi(pi, v, vi) {
-			if (vi->flags & VI_INIT_DONE) {
-				struct sge_rxq *rxq;
-				struct sge_txq *txq;
-				struct sge_wrq *wrq;
-
-				for_each_rxq(vi, i, rxq) {
-#if defined(INET) || defined(INET6)
-					rxq->lro.lro_queued = 0;
-					rxq->lro.lro_flushed = 0;
-#endif
-					rxq->rxcsum = 0;
-					rxq->vlan_extraction = 0;
-				}
-
-				for_each_txq(vi, i, txq) {
-					txq->txcsum = 0;
-					txq->tso_wrs = 0;
-					txq->vlan_insertion = 0;
-					txq->imm_wrs = 0;
-					txq->sgl_wrs = 0;
-					txq->txpkt_wrs = 0;
-					txq->txpkts0_wrs = 0;
-					txq->txpkts1_wrs = 0;
-					txq->txpkts0_pkts = 0;
-					txq->txpkts1_pkts = 0;
-					txq->raw_wrs = 0;
-					mp_ring_reset_stats(txq->r);
-				}
-
-#if defined(TCP_OFFLOAD) || defined(RATELIMIT)
-				/* nothing to clear for each ofld_rxq */
-
-				for_each_ofld_txq(vi, i, wrq) {
-					wrq->tx_wrs_direct = 0;
-					wrq->tx_wrs_copied = 0;
-				}
-#endif
-
-				if (IS_MAIN_VI(vi)) {
-					wrq = &sc->sge.ctrlq[pi->port_id];
-					wrq->tx_wrs_direct = 0;
-					wrq->tx_wrs_copied = 0;
-				}
-			}
-		}
+	case CHELSIO_T4_CLEAR_STATS:
+		rc = clear_stats(sc, *(uint32_t *)data);
 		break;
-	}
 	case CHELSIO_T4_SCHED_CLASS:
 		rc = t4_set_sched_class(sc, (struct t4_sched_params *)data);
 		break;

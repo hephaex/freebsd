@@ -611,7 +611,7 @@ AcpiGetObjectInfo (
 
     if (Cls)
     {
-        NextIdString = AcpiNsCopyDeviceId (&Info->ClassCode,
+       (void) AcpiNsCopyDeviceId (&Info->ClassCode,
             Cls, NextIdString);
     }
 
@@ -691,8 +691,8 @@ AcpiInstallMethod (
 
     /* Table must be a DSDT or SSDT */
 
-    if (!ACPI_COMPARE_NAME (Table->Signature, ACPI_SIG_DSDT) &&
-        !ACPI_COMPARE_NAME (Table->Signature, ACPI_SIG_SSDT))
+    if (!ACPI_COMPARE_NAMESEG (Table->Signature, ACPI_SIG_DSDT) &&
+        !ACPI_COMPARE_NAMESEG (Table->Signature, ACPI_SIG_SSDT))
     {
         return (AE_BAD_HEADER);
     }

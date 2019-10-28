@@ -857,6 +857,18 @@ rsu_get_multi_pos(const uint8_t maddr[])
 	return (pos);
 }
 
+static u_int
+rsu_hash_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	uint32_t *mfilt = arg;
+	uint8_t pos;
+
+	pos = rsu_get_multi_pos(LLADDR(sdl));
+	mfilt[pos / 32] |= (1 << (pos % 32));
+
+	return (1);
+}
+
 static void
 rsu_set_multi(struct rsu_softc *sc)
 {
@@ -868,28 +880,13 @@ rsu_set_multi(struct rsu_softc *sc)
 	/* general structure was copied from ath(4). */
 	if (ic->ic_allmulti == 0) {
 		struct ieee80211vap *vap;
-		struct ifnet *ifp;
-		struct ifmultiaddr *ifma;
 
 		/*
 		 * Merge multicast addresses to form the hardware filter.
 		 */
 		mfilt[0] = mfilt[1] = 0;
-		TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next) {
-			ifp = vap->iv_ifp;
-			if_maddr_rlock(ifp);
-			CK_STAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
-				caddr_t dl;
-				uint8_t pos;
-
-				dl = LLADDR((struct sockaddr_dl *)
-				    ifma->ifma_addr);
-				pos = rsu_get_multi_pos(dl);
-
-				mfilt[pos / 32] |= (1 << (pos % 32));
-			}
-			if_maddr_runlock(ifp);
-		}
+		TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next)
+			if_foreach_llmaddr(vap->iv_ifp, rsu_hash_maddr, &mfilt);
 	} else
 		mfilt[0] = mfilt[1] = ~0;
 
@@ -2447,8 +2444,6 @@ rsu_rx_frame(struct rsu_softc *sc, struct mbuf *m)
 
 		tap->wr_rate = rxs.c_rate;
 		tap->wr_dbm_antsignal = rssi;
-		tap->wr_chan_freq = htole16(ic->ic_curchan->ic_freq);
-		tap->wr_chan_flags = htole16(ic->ic_curchan->ic_flags);
 	};
 
 	(void) ieee80211_add_rx_params(m, &rxs);
@@ -2750,7 +2745,6 @@ rsu_tx_start(struct rsu_softc *sc, struct ieee80211_node *ni,
     struct mbuf *m0, struct rsu_data *data)
 {
 	const struct ieee80211_txparam *tp = ni->ni_txparms;
-	struct ieee80211com *ic = &sc->sc_ic;
         struct ieee80211vap *vap = ni->ni_vap;
 	struct ieee80211_frame *wh;
 	struct ieee80211_key *k = NULL;
@@ -2894,8 +2888,6 @@ rsu_tx_start(struct rsu_softc *sc, struct ieee80211_node *ni,
 		struct rsu_tx_radiotap_header *tap = &sc->sc_txtap;
 
 		tap->wt_flags = 0;
-		tap->wt_chan_freq = htole16(ic->ic_curchan->ic_freq);
-		tap->wt_chan_flags = htole16(ic->ic_curchan->ic_flags);
 		ieee80211_radiotap_tx(vap, m0);
 	}
 

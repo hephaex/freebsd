@@ -507,6 +507,12 @@ TrTransformSubtree (
         }
         break;
 
+    case PARSEOP_PROCESSOR:
+
+        AslError (ASL_WARNING, ASL_MSG_LEGACY_PROCESSOR_OP, Op, Op->Asl.ExternalName);
+
+        break;
+
     default:
 
         /* Nothing to do here for other opcodes */
@@ -553,7 +559,7 @@ TrDoDefinitionBlock (
              * to be at the root of the namespace;  Therefore, namepath
              * optimization can only be performed on the DSDT.
              */
-            if (!ACPI_COMPARE_NAME (Next->Asl.Value.String, ACPI_SIG_DSDT))
+            if (!ACPI_COMPARE_NAMESEG (Next->Asl.Value.String, ACPI_SIG_DSDT))
             {
                 AslGbl_ReferenceOptimizationFlag = FALSE;
             }

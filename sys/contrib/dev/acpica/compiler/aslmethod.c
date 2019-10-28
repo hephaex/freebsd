@@ -199,6 +199,8 @@ MtMethodAnalysisWalkBegin (
     ACPI_PARSE_OBJECT       *NextType;
     ACPI_PARSE_OBJECT       *NextParamType;
     UINT8                   ActualArgs = 0;
+    BOOLEAN                 HidExists;
+    BOOLEAN                 AdrExists;
 
 
     /* Build cross-reference output file if requested */
@@ -228,7 +230,7 @@ MtMethodAnalysisWalkBegin (
          * 1) _PS0 - One of these must exist: _PS1, _PS2, _PS3
          * 2) _PS1/_PS2/_PS3: A _PS0 must exist
          */
-        if (ACPI_COMPARE_NAME (METHOD_NAME__PS0, Op->Asl.NameSeg))
+        if (ACPI_COMPARE_NAMESEG (METHOD_NAME__PS0, Op->Asl.NameSeg))
         {
             /* For _PS0, one of _PS1/_PS2/_PS3 must exist */
 
@@ -241,9 +243,9 @@ MtMethodAnalysisWalkBegin (
             }
         }
         else if (
-            ACPI_COMPARE_NAME (METHOD_NAME__PS1, Op->Asl.NameSeg) ||
-            ACPI_COMPARE_NAME (METHOD_NAME__PS2, Op->Asl.NameSeg) ||
-            ACPI_COMPARE_NAME (METHOD_NAME__PS3, Op->Asl.NameSeg))
+            ACPI_COMPARE_NAMESEG (METHOD_NAME__PS1, Op->Asl.NameSeg) ||
+            ACPI_COMPARE_NAMESEG (METHOD_NAME__PS2, Op->Asl.NameSeg) ||
+            ACPI_COMPARE_NAMESEG (METHOD_NAME__PS3, Op->Asl.NameSeg))
         {
             /* For _PS1/_PS2/_PS3, a _PS0 must exist */
 
@@ -535,11 +537,25 @@ MtMethodAnalysisWalkBegin (
 
     case PARSEOP_DEVICE:
 
-        if (!ApFindNameInDeviceTree (METHOD_NAME__HID, Op) &&
-            !ApFindNameInDeviceTree (METHOD_NAME__ADR, Op))
+        /* Check usage of _HID and _ADR objects */
+
+        HidExists = ApFindNameInDeviceTree (METHOD_NAME__HID, Op);
+        AdrExists = ApFindNameInDeviceTree (METHOD_NAME__ADR, Op);
+
+        if (!HidExists && !AdrExists)
         {
             AslError (ASL_WARNING, ASL_MSG_MISSING_DEPENDENCY, Op,
                 "Device object requires a _HID or _ADR in same scope");
+        }
+        else if (HidExists && AdrExists)
+        {
+            /*
+             * According to the ACPI spec, "A device object must contain
+             * either an _HID object or an _ADR object, but should not contain
+             * both".
+             */
+            AslError (ASL_WARNING, ASL_MSG_MULTIPLE_TYPES, Op,
+                "Device object requires either a _HID or _ADR, but not both");
         }
         break;
 

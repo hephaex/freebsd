@@ -184,7 +184,7 @@ div_input(struct mbuf **mp, int *offp, int proto)
  * then pass them along with mbuf chain.
  */
 static void
-divert_packet(struct mbuf *m, int incoming)
+divert_packet(struct mbuf *m, bool incoming)
 {
 	struct ip *ip;
 	struct inpcb *inp;
@@ -231,10 +231,10 @@ divert_packet(struct mbuf *m, int incoming)
 
 		/* Sanity check */
 		M_ASSERTPKTHDR(m);
+		NET_EPOCH_ASSERT();
 
 		/* Find IP address for receive interface */
 		ifp = m->m_pkthdr.rcvif;
-		if_addr_rlock(ifp);
 		CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 			if (ifa->ifa_addr->sa_family != AF_INET)
 				continue;
@@ -242,7 +242,6 @@ divert_packet(struct mbuf *m, int incoming)
 			    ((struct sockaddr_in *) ifa->ifa_addr)->sin_addr;
 			break;
 		}
-		if_addr_runlock(ifp);
 	}
 	/*
 	 * Record the incoming interface name whenever we have one.
